@@ -1,0 +1,63 @@
+name: Build, SBOM, sign
+
+on:
+  workflow_dispatch:      # lets you run it manually from the Actions tab
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read          # read the repo
+  packages: write         # push the image to GitHub's registry (GHCR)
+  id-token: write         # get an OIDC token, used by cosign for keyless signing
+
+env:
+  # Image names must be lowercase
+  IMAGE: ghcr.io/segunbabz/sentineldesk-supply-chain-demo
+
+jobs:
+  build-sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Log in to GHCR with the temporary token GitHub provides to every run
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the image from the Dockerfile and push it, tagged with the commit ID
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      # SBOM: list every component inside the image (CycloneDX format).
+      # Saved as a downloadable artifact on the run.
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Sign the exact image by its digest (a unique fingerprint), "keyless":
+      # the signing identity comes from this workflow's OIDC token, so no private key to protect
+      - name: Sign image
+        run: cosign sign --yes ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+
+      # Verify the signature, and require it to have come from THIS workflow in THIS repo
+      - name: Verify signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "^https://github.com/Segunbabz/sentineldesk-supply-chain-demo/.github/workflows/build-sign.yml@.*" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
